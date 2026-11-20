@@ -349,7 +349,7 @@ const messageHandlers = {
         money: v.money
       }))
     });
-    wsInfo.set(ws, { playerId: player.id, username: player.username, villageId: null, spectatingVillageId: null });
+    wsInfo.set(ws, { playerId: player.id, username: player.username, villageId: null, spectatingVillageId: null, tabVisible: true });
   },
 
   // Tworzenie wioski (REGUŁA: maks. 1 wioska na gracza!)

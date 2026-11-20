@@ -423,7 +423,27 @@ function handleServerMessage(msg) {
 
     case 'leader_assigned':
       if (!isSpectating) {
+        const wasLeader = isLeader;
         isLeader = msg.isLeader;
+        if (!wasLeader && isLeader) {
+          sendDriftCorrection();
+        }
+      }
+      break;
+
+    case 'worker_action':
+      if (isSpectating || !isLeader) {
+        onWorkerActionReceived(msg);
+      }
+      break;
+
+    case 'plant_harvested':
+      onPlantHarvestedReceived(msg);
+      break;
+
+    case 'workers_drift_correction':
+      if (isSpectating || !isLeader) {
+        onDriftCorrectionReceived(msg);
       }
       break;
 
@@ -911,18 +931,18 @@ function loadSpectatorVillage(msg) {
 // --- INICJALIZACJA ROZMIARU I SIATKI ---
 function resizeCanvas() {
   if (!gameActive) return;
-  canvas.width = canvas.parentElement.clientWidth - 360;
-  canvas.height = canvas.parentElement.clientHeight;
-  COLS = Math.floor(canvas.width / TILE_SIZE);
-  ROWS = Math.floor(canvas.height / TILE_SIZE);
-  fieldArea.gw = Math.max(8, COLS - 15);
-  fieldArea.gh = Math.max(8, ROWS - 4);
+  canvas.width = Math.max(960, canvas.parentElement.clientWidth - 360);
+  canvas.height = Math.max(680, canvas.parentElement.clientHeight);
+  COLS = Math.max(30, Math.floor(canvas.width / TILE_SIZE));
+  ROWS = Math.max(22, Math.floor(canvas.height / TILE_SIZE));
   rebuildWalkGrid();
 }
 window.addEventListener('resize', resizeCanvas);
 
 function rebuildWalkGrid() {
-  walkGrid = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+  const maxRows = Math.max(ROWS, fieldArea.gy + fieldArea.gh + 2);
+  const maxCols = Math.max(COLS, fieldArea.gx + fieldArea.gw + 2);
+  walkGrid = Array.from({ length: maxRows }, () => Array(maxCols).fill(0));
   for (let y = depot.gy; y < depot.gy + depot.gh; y++) {
     for (let x = depot.gx; x < depot.gx + depot.gw; x++) {
       if (walkGrid[y] && walkGrid[y][x] !== undefined) walkGrid[y][x] = 1;
@@ -937,7 +957,7 @@ function rebuildWalkGrid() {
   });
 }
 
-// Deterministyczne generowanie pola bawełny z seedem wioski
+// Deterministyczne generowanie pola bawełny z seedem wioski (stałe pole 15x18 dla wszystkich graczy)
 function generateCottonField() {
   cottonPlants = [];
   let seed = 12345;
@@ -970,23 +990,28 @@ function generateCottonField() {
 
 // --- A* PATHFINDING ---
 function findNearestWalkable(gx, gy) {
-  if (walkGrid[gy] && walkGrid[gy][gx] === 0) return { gx, gy };
+  const maxRows = walkGrid.length;
+  const maxCols = walkGrid[0] ? walkGrid[0].length : COLS;
+  if (gy >= 0 && gy < maxRows && gx >= 0 && gx < maxCols && walkGrid[gy][gx] === 0) return { gx, gy };
   for (let r = 1; r < 6; r++) {
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
         const nx = gx + dx, ny = gy + dy;
-        if (ny >= 0 && ny < ROWS && nx >= 0 && nx < COLS && walkGrid[ny][nx] === 0) {
+        if (ny >= 0 && ny < maxRows && nx >= 0 && nx < maxCols && walkGrid[ny][nx] === 0) {
           return { gx: nx, gy: ny };
         }
       }
     }
   }
-  return { gx: 0, gy: 0 };
+  return { gx: Math.max(0, Math.min(maxCols - 1, gx)), gy: Math.max(0, Math.min(maxRows - 1, gy)) };
 }
 
 function findPathAStar(startX, startY, targetX, targetY) {
   const start = findNearestWalkable(Math.floor(startX / TILE_SIZE), Math.floor(startY / TILE_SIZE));
   const goal = findNearestWalkable(Math.floor(targetX / TILE_SIZE), Math.floor(targetY / TILE_SIZE));
+
+  const maxRows = walkGrid.length;
+  const maxCols = walkGrid[0] ? walkGrid[0].length : COLS;
 
   const openSet = [{ x: start.gx, y: start.gy, g: 0, f: 0, parent: null }];
   const closedSet = new Set();
@@ -1014,7 +1039,7 @@ function findPathAStar(startX, startY, targetX, targetY) {
     ];
 
     for (const n of neighbors) {
-      if (n.x < 0 || n.x >= COLS || n.y < 0 || n.y >= ROWS) continue;
+      if (n.x < 0 || n.x >= maxCols || n.y < 0 || n.y >= maxRows) continue;
       if (walkGrid[n.y][n.x] === 1) continue;
       if (closedSet.has(`${n.x},${n.y}`)) continue;
 
@@ -1134,11 +1159,11 @@ function onBoostUpgraded(msg) {
 
 function onOnlineChanged(msg) {
   onlinePlayers = msg.online || [];
-  if (!isSpectating) {
-    isLeader = onlinePlayers.length > 0 && onlinePlayers[0].id === currentPlayer.id;
-  }
   updateOnlineDisplay();
   updateTeamPanel();
+  if (msg.type === 'player_joined' && isLeader) {
+    sendDriftCorrection();
+  }
 }
 
 function updateOnlineDisplay() {
@@ -1192,31 +1217,163 @@ function updateTeamPanel() {
   panel.innerHTML = html;
 }
 
-// Odbiór danych synchronizacji od lidera (dla klientów niebędących liderem i obserwatorów)
-function onWorkersSyncReceived(msg) {
+// --- ODBIÓR AKCJI PRACOWNIKÓW OD LIDERA (MÓWIMY GDZIE IDĄ, A NIE GDZIE SĄ) ---
+function onWorkerActionReceived(msg) {
+  const w = workers.find(item => item.id === msg.workerId);
+  if (!w) return;
+  const hut = huts.find(h => h.id === w.hutId);
+
+  switch (msg.action) {
+    case 'TO_COTTON': {
+      if (msg.startX !== undefined && (w.insideHut || Math.hypot(w.x - msg.startX, w.y - msg.startY) > 24)) {
+        w.x = msg.startX;
+        w.y = msg.startY;
+      }
+      w.insideHut = false;
+      let targetX = msg.targetX;
+      let targetY = msg.targetY;
+      let plant = cottonPlants[msg.plantIdx];
+      if (plant) {
+        plant.reservedBy = w.id;
+        w.targetPlant = plant;
+        targetX = plant.x;
+        targetY = plant.y;
+      }
+      if (targetX !== undefined && targetY !== undefined) {
+        w.state = 'TO_COTTON';
+        w.path = findPathAStar(w.x, w.y, targetX, targetY);
+      }
+      break;
+    }
+    case 'HARVESTING': {
+      w.state = 'HARVESTING';
+      w.path = [];
+      break;
+    }
+    case 'TO_DEPOT': {
+      if (msg.startX !== undefined && (w.insideHut || Math.hypot(w.x - msg.startX, w.y - msg.startY) > 24)) {
+        w.x = msg.startX;
+        w.y = msg.startY;
+      }
+      w.insideHut = false;
+      w.state = 'TO_DEPOT';
+      const targetX = msg.targetX !== undefined ? msg.targetX : (depot.gx + 3) * TILE_SIZE + 10;
+      const targetY = msg.targetY !== undefined ? msg.targetY : (depot.gy + 1) * TILE_SIZE;
+      w.path = findPathAStar(w.x, w.y, targetX, targetY);
+      break;
+    }
+    case 'AT_DEPOT': {
+      w.carrying = 0;
+      w.state = 'IDLE';
+      w.path = [];
+      if (msg.earned) {
+        floatingTexts.push({
+          x: (depot.gx + 1.5) * TILE_SIZE,
+          y: (depot.gy) * TILE_SIZE - 10,
+          text: `+${msg.earned}$`,
+          alpha: 1
+        });
+      }
+      break;
+    }
+    case 'TO_HUT': {
+      if (hut) {
+        w.state = 'TO_HUT';
+        w.path = findPathAStar(w.x, w.y, (hut.gx + 1) * TILE_SIZE, (hut.gy + 2) * TILE_SIZE + 10);
+      }
+      break;
+    }
+    case 'EXIT_HUT': {
+      if (hut) {
+        w.insideHut = false;
+        w.x = (hut.gx + 1) * TILE_SIZE;
+        w.y = (hut.gy + 2) * TILE_SIZE + 10;
+        w.state = 'IDLE';
+        w.path = [];
+      }
+      break;
+    }
+  }
+}
+
+// Odbiór zerwania bawełny od lidera (natychmiastowe zniknięcie białego kwiatu bawełny u wszystkich)
+function onPlantHarvestedReceived(msg) {
+  let plant = cottonPlants[msg.plantIdx];
+  if (!plant && msg.targetX !== undefined && msg.targetY !== undefined) {
+    plant = cottonPlants.find(p => p.grown && Math.hypot(p.x - msg.targetX, p.y - msg.targetY) < 24);
+  }
+  if (plant) {
+    plant.grown = false;
+    plant.regrowTimer = 14;
+    plant.reservedBy = null;
+  }
+  const w = workers.find(item => item.id === msg.workerId);
+  if (w) {
+    w.carrying = Math.min(w.maxCarry, (w.carrying || 0) + 1);
+    w.targetPlant = null;
+    w.state = 'IDLE';
+  }
+}
+
+// Okresowa korekta pozycji pracowników (co ~2.5s zamiast teleportera co 100ms)
+function onDriftCorrectionReceived(msg) {
   if (msg.gameMinutes !== undefined) {
-    state.gameMinutes = msg.gameMinutes;
+    if (Math.abs(state.gameMinutes - msg.gameMinutes) > 3) {
+      state.gameMinutes = msg.gameMinutes;
+    }
   }
   if (msg.workers && Array.isArray(msg.workers)) {
     msg.workers.forEach(sw => {
       const w = workers.find(item => item.id === sw.id);
       if (w) {
-        w.x = sw.x;
-        w.y = sw.y;
-        w.insideHut = sw.insideHut;
-        w.state = sw.state;
         w.carrying = sw.carrying;
+        if (sw.insideHut !== w.insideHut) {
+          w.insideHut = sw.insideHut;
+          w.x = sw.x;
+          w.y = sw.y;
+          w.path = [];
+        } else if (!w.insideHut) {
+          const dist = Math.hypot(w.x - sw.x, w.y - sw.y);
+          if (dist > 32) {
+            w.x = sw.x;
+            w.y = sw.y;
+          }
+        }
       }
     });
   }
-  if (msg.harvested && Array.isArray(msg.harvested)) {
-    msg.harvested.forEach(idx => {
-      if (cottonPlants[idx]) {
-        cottonPlants[idx].grown = false;
-        cottonPlants[idx].regrowTimer = 14;
+  if (msg.harvestedPlants && Array.isArray(msg.harvestedPlants)) {
+    msg.harvestedPlants.forEach(hp => {
+      const p = cottonPlants[hp.idx];
+      if (p) {
+        p.grown = false;
+        p.regrowTimer = hp.regrowTimer;
       }
     });
   }
+}
+
+// Kompatybilność wsteczna z workers_sync
+function onWorkersSyncReceived(msg) {
+  onDriftCorrectionReceived(msg);
+}
+
+// Funkcja wysyłająca pełną korektę pozycji i zerwanych roślin
+function sendDriftCorrection() {
+  if (!isLeader || isSpectating || !gameActive) return;
+  sendMsg({
+    type: 'workers_drift_correction',
+    gameMinutes: state.gameMinutes,
+    harvestedPlants: cottonPlants.filter(p => !p.grown).map(p => ({ idx: p.idx, regrowTimer: Math.round(p.regrowTimer * 10) / 10 })),
+    workers: workers.map(w => ({
+      id: w.id,
+      x: Math.round(w.x),
+      y: Math.round(w.y),
+      insideHut: w.insideHut,
+      state: w.state,
+      carrying: w.carrying
+    }))
+  });
 }
 
 // --- SYMULACJA PRACOWNIKÓW ---
@@ -1226,55 +1383,12 @@ function isWorkTime() {
 }
 
 function updateWorkers(dt) {
-  // Tylko lider wykonuje decyzyjną logikę AI i wysyła synchronizację
-  if (!isLeader || isSpectating) return;
-
   const working = isWorkTime();
   const boostMult = state.boost.active ? state.boost.multiplier : 1.0;
-  const harvestedThisTick = [];
 
+  // 1. ZAWSZE płynnie poruszaj pracownikami po wyznaczonej ścieżce (u WSZYSTKICH graczy z 60 FPS)
   workers.forEach(w => {
-    const hut = huts.find(h => h.id === w.hutId);
-    if (!hut) return;
-
-    // 11:00 -> wyjście z chaty
-    if (working && w.insideHut) {
-      w.insideHut = false;
-      w.x = (hut.gx + 1) * TILE_SIZE;
-      w.y = (hut.gy + 2) * TILE_SIZE + 10;
-      w.state = 'IDLE';
-    }
-
-    // 20:00 -> powrót do chaty
-    if (!working && !w.insideHut && w.state !== 'TO_HUT') {
-      if (w.targetPlant) { w.targetPlant.reservedBy = null; w.targetPlant = null; }
-      w.state = 'TO_HUT';
-      w.path = findPathAStar(w.x, w.y, (hut.gx + 1) * TILE_SIZE, (hut.gy + 2) * TILE_SIZE + 10);
-    }
-
     if (w.insideHut) return;
-
-    // Wybór celu
-    if (w.state === 'IDLE') {
-      if (w.carrying >= w.maxCarry) {
-        w.state = 'TO_DEPOT';
-        w.path = findPathAStar(w.x, w.y, (depot.gx + 3) * TILE_SIZE + 10, (depot.gy + 1) * TILE_SIZE);
-        return;
-      }
-
-      // Znajdź najbliższą dojrzałą bawełnę
-      const available = cottonPlants.filter(p => p.grown && !p.reservedBy);
-      if (available.length > 0) {
-        available.sort((a, b) => Math.hypot(a.x - w.x, a.y - w.y) - Math.hypot(b.x - w.x, b.y - w.y));
-        const chosen = available[0];
-        chosen.reservedBy = w.id;
-        w.targetPlant = chosen;
-        w.state = 'TO_COTTON';
-        w.path = findPathAStar(w.x, w.y, chosen.x, chosen.y);
-      }
-    }
-
-    // Poruszanie się po wyznaczonej ścieżce
     if (w.path.length > 0) {
       const target = w.path[0];
       const dx = target.x - w.x;
@@ -1289,10 +1403,82 @@ function updateWorkers(dt) {
         w.x += (dx / dist) * moveStep;
         w.y += (dy / dist) * moveStep;
       }
-    } else {
+    }
+  });
+
+  // 2. Tylko autorytatywny LIDER podejmuje decyzyjną logikę AI i wysyła cel (gdzie idą) do innych graczy
+  if (!isLeader || isSpectating) return;
+
+  workers.forEach(w => {
+    const hut = huts.find(h => h.id === w.hutId);
+    if (!hut) return;
+
+    // 11:00 -> wyjście z chaty
+    if (working && w.insideHut) {
+      w.insideHut = false;
+      w.x = (hut.gx + 1) * TILE_SIZE;
+      w.y = (hut.gy + 2) * TILE_SIZE + 10;
+      w.state = 'IDLE';
+      sendMsg({ type: 'worker_action', workerId: w.id, action: 'EXIT_HUT' });
+    }
+
+    // 20:00 -> powrót do chaty
+    if (!working && !w.insideHut && w.state !== 'TO_HUT') {
+      if (w.targetPlant) { w.targetPlant.reservedBy = null; w.targetPlant = null; }
+      w.state = 'TO_HUT';
+      w.path = findPathAStar(w.x, w.y, (hut.gx + 1) * TILE_SIZE, (hut.gy + 2) * TILE_SIZE + 10);
+      sendMsg({ type: 'worker_action', workerId: w.id, action: 'TO_HUT' });
+    }
+
+    if (w.insideHut) return;
+
+    // Przydział zadania (IDLE)
+    if (w.state === 'IDLE') {
+      if (w.carrying >= w.maxCarry) {
+        w.state = 'TO_DEPOT';
+        const targetX = (depot.gx + 3) * TILE_SIZE + 10;
+        const targetY = (depot.gy + 1) * TILE_SIZE;
+        w.path = findPathAStar(w.x, w.y, targetX, targetY);
+        sendMsg({
+          type: 'worker_action',
+          workerId: w.id,
+          action: 'TO_DEPOT',
+          targetX: Math.round(targetX),
+          targetY: Math.round(targetY),
+          startX: Math.round(w.x),
+          startY: Math.round(w.y)
+        });
+        return;
+      }
+
+      // Znajdź najbliższą dojrzałą bawełnę
+      const available = cottonPlants.filter(p => p.grown && !p.reservedBy);
+      if (available.length > 0) {
+        available.sort((a, b) => Math.hypot(a.x - w.x, a.y - w.y) - Math.hypot(b.x - w.x, b.y - w.y));
+        const chosen = available[0];
+        chosen.reservedBy = w.id;
+        w.targetPlant = chosen;
+        w.state = 'TO_COTTON';
+        w.path = findPathAStar(w.x, w.y, chosen.x, chosen.y);
+        sendMsg({
+          type: 'worker_action',
+          workerId: w.id,
+          action: 'TO_COTTON',
+          plantIdx: chosen.idx,
+          targetX: Math.round(chosen.x),
+          targetY: Math.round(chosen.y),
+          startX: Math.round(w.x),
+          startY: Math.round(w.y)
+        });
+      }
+    }
+
+    // Gdy dotarł do celu ścieżki
+    if (w.path.length === 0) {
       if (w.state === 'TO_COTTON') {
         w.state = 'HARVESTING';
         w.actionTimer = 0.7 / boostMult;
+        sendMsg({ type: 'worker_action', workerId: w.id, action: 'HARVESTING' });
       } else if (w.state === 'HARVESTING') {
         w.actionTimer -= dt;
         if (w.actionTimer <= 0) {
@@ -1300,7 +1486,13 @@ function updateWorkers(dt) {
             w.targetPlant.grown = false;
             w.targetPlant.regrowTimer = 14;
             w.targetPlant.reservedBy = null;
-            harvestedThisTick.push(w.targetPlant.idx);
+            sendMsg({
+              type: 'plant_harvested',
+              plantIdx: w.targetPlant.idx,
+              targetX: Math.round(w.targetPlant.x),
+              targetY: Math.round(w.targetPlant.y),
+              workerId: w.id
+            });
             w.targetPlant = null;
           }
           w.carrying += 1;
@@ -1309,6 +1501,7 @@ function updateWorkers(dt) {
       } else if (w.state === 'TO_DEPOT') {
         const earned = Math.round(w.carrying * 15 * w.valueMult);
         sendMsg({ type: 'sync_earnings', earned });
+        sendMsg({ type: 'worker_action', workerId: w.id, action: 'AT_DEPOT', earned });
         floatingTexts.push({ x: w.x, y: w.y - 12, text: `+${earned}$`, alpha: 1 });
         w.carrying = 0;
         w.state = 'IDLE';
@@ -1319,23 +1512,11 @@ function updateWorkers(dt) {
     }
   });
 
-  // Regularne rozgłaszanie stanu pracowników do innych graczy (10 FPS)
+  // Okresowa korekta pozycji (co 2.5s, aby zniwelować rozbieżności bez rwania animacji)
   syncCounter += dt;
-  if (syncCounter >= 0.1) {
+  if (syncCounter >= 2.5) {
     syncCounter = 0;
-    sendMsg({
-      type: 'workers_sync',
-      gameMinutes: state.gameMinutes,
-      harvested: harvestedThisTick,
-      workers: workers.map(w => ({
-        id: w.id,
-        x: Math.round(w.x * 10) / 10,
-        y: Math.round(w.y * 10) / 10,
-        insideHut: w.insideHut,
-        state: w.state,
-        carrying: w.carrying
-      }))
-    });
+    sendDriftCorrection();
   }
 }
 
@@ -1651,23 +1832,74 @@ function saveStateToServer() {
   sendMsg({ type: 'sync_boost', active: state.boost.active, timer: state.boost.timer, cooldownTimer: state.boost.cooldownTimer });
 }
 
-// --- PĘTLA GRY ---
+// --- PĘTLA GRY Z OBSŁUGĄ KARTY W TLE ---
 let lastTime = performance.now();
-function loop(now) {
-  const dt = Math.min(0.1, (now - lastTime) / 1000);
-  lastTime = now;
-  update(dt);
-  draw();
+
+function stepGame(dt) {
+  let remaining = dt;
+  while (remaining > 0) {
+    const stepDt = Math.min(0.05, remaining);
+    update(stepDt);
+    remaining -= stepDt;
+  }
 
   saveCounter += dt;
   if (saveCounter >= 10) {
     saveCounter = 0;
     saveStateToServer();
   }
-
-  requestAnimationFrame(loop);
 }
-requestAnimationFrame(loop);
+
+function animLoop(now) {
+  if (!document.hidden) {
+    const dt = Math.min(0.2, (now - lastTime) / 1000);
+    lastTime = now;
+    stepGame(dt);
+    draw();
+  }
+  requestAnimationFrame(animLoop);
+}
+requestAnimationFrame(animLoop);
+
+// Ticker w tle (dla kart w tle, gdy requestAnimationFrame jest wstrzymane)
+setInterval(() => {
+  if (document.hidden && gameActive) {
+    const now = performance.now();
+    const dt = Math.min(1.0, (now - lastTime) / 1000);
+    lastTime = now;
+    stepGame(dt);
+  }
+}, 100);
+
+// Web Worker dla nieaktywnych kart (aby zapobiec dławieniu setInterval do 1s przez przeglądarkę)
+try {
+  const bgBlob = new Blob([`
+    let t = null;
+    self.onmessage = function(e) {
+      if (e.data === 'start' && !t) {
+        t = setInterval(function() { self.postMessage('tick'); }, 100);
+      }
+    };
+  `], { type: 'application/javascript' });
+  const bgWorker = new Worker(URL.createObjectURL(bgBlob));
+  bgWorker.onmessage = function() {
+    if (document.hidden && gameActive) {
+      const now = performance.now();
+      const dt = Math.min(0.5, (now - lastTime) / 1000);
+      lastTime = now;
+      stepGame(dt);
+    }
+  };
+  bgWorker.postMessage('start');
+} catch (e) {
+  // Ignoruj jeśli Web Worker jest zablokowany przez środowisko
+}
+
+// Powiadomienie serwera o widoczności karty
+document.addEventListener('visibilitychange', () => {
+  lastTime = performance.now();
+  sendMsg({ type: 'tab_visibility', visible: !document.hidden });
+});
 
 // START POŁĄCZENIA
 connectWS();
