@@ -5,7 +5,27 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const Database = require('better-sqlite3');
+let Database;
+try {
+  Database = require('better-sqlite3');
+} catch {
+  // Fallback dla nowszych wersji Node.js (>= 22.5.0) bez potrzeby kompilowania C++
+  const { DatabaseSync } = require('node:sqlite');
+  Database = class {
+    constructor(filename) {
+      this.db = new DatabaseSync(filename);
+    }
+    pragma(sql) {
+      try { this.db.exec(`PRAGMA ${sql}`); } catch {}
+    }
+    exec(sql) {
+      return this.db.exec(sql);
+    }
+    prepare(sql) {
+      return this.db.prepare(sql);
+    }
+  };
+}
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const crypto = require('crypto');

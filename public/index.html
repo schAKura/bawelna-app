@@ -301,17 +301,29 @@ let isLeader = false; // Lider synchronizacji w wiosce
 let isSpectating = false; // Czy aktualnie oglądamy obcą wioskę z rankingu
 let cachedPassword = '';
 
-// Obsługa parametru URL ?join=KOD
+// Obsługa parametrów URL (?join=KOD, ?server=ADRES)
 const urlParams = new URLSearchParams(window.location.search);
 const autoJoinCode = urlParams.get('join') || '';
 
+// --- KONFIGURACJA SERWERA ---
+// Jeśli wysyłasz komuś sam plik HTML lub hostujesz frontend osobno (np. GitHub Pages),
+// wpisz tutaj stały publiczny adres swojego serwera (np. 'moj-serwer.onrender.com' lub z ngrok).
+// Gdy jest puste, łączy się z adresem bieżącej strony lub domyślnie z localhost:3000.
+const REMOTE_SERVER_URL = '192.168.0.176:3000'; 
+
 function connectWS() {
-  const isHttps = location.protocol === 'https:';
-  let host = location.host;
-  if (!host || location.protocol === 'file:') {
-    host = 'localhost:3000';
+  // Priorytet adresu: 1. parametr ?server= w URL, 2. stała REMOTE_SERVER_URL, 3. host przeglądarki / localhost
+  let host = urlParams.get('server') || REMOTE_SERVER_URL;
+  if (!host) {
+    host = location.host;
+    if (!host || location.protocol === 'file:') {
+      host = 'localhost:3000';
+    }
   }
-  const protocol = isHttps ? 'wss:' : 'ws:';
+
+  // Bezpieczny WebSocket (wss://) dla domen HTTPS/chmury, ws:// dla lokalnych/IP
+  const isSecure = location.protocol === 'https:' || host.includes('ngrok') || host.includes('render.com') || host.includes('railway.app');
+  const protocol = isSecure ? 'wss:' : 'ws:';
   ws = new WebSocket(`${protocol}//${host}`);
 
   ws.onopen = () => {
